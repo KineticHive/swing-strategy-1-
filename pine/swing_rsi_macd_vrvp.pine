@@ -87,8 +87,8 @@ f_profile(int len, int rows, float va) =>
                 int r = math.min(int((h - bot) / step), rows - 1)
                 vols.set(r, vols.get(r) + v)
             else
-                int r0 = math.max(int((l - bot) / step), 0)
                 int r1 = math.min(int((h - bot) / step), rows - 1)
+                int r0 = math.min(math.max(int((l - bot) / step), 0), r1)
                 for r = r0 to r1
                     float rlo = bot + r * step
                     float ov = math.min(h, rlo + step) - math.max(l, rlo)
@@ -252,6 +252,6 @@ if showHist and isVisRightEdge and visLen >= 2
         vrLines.push(line.new(x0, vVah, bar_index, vVah, color = colVaLine, style = line.style_dashed))
         vrLines.push(line.new(x0, vVal, bar_index, vVal, color = colVaLine, style = line.style_dashed))
 
-// Alerts
-alertcondition(sig > 0, "Long signal", "Swing long setup on {{ticker}} @ {{close}}")
-alertcondition(sig < 0, "Short signal", "Swing short setup on {{ticker}} @ {{close}}")
+// Alerts: create an alert on this strategy and choose "alert() function calls only".
+if sig != 0 and flat
+    alert((sig > 0 ? "LONG " : "SHORT ") + setup + " on " + syminfo.ticker + " @ " + str.tostring(close) + " | stop " + str.tostring(sStop, format.mintick) + " | target " + str.tostring(sTgt, format.mintick), alert.freq_once_per_bar_close)
