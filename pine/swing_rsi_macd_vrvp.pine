@@ -64,6 +64,12 @@ showPanel   = input.bool(true, "Show position panel", group = grpSig)
 colBuy      = input.color(color.new(color.green, 0), "BUY colour", group = grpSig)
 colSell     = input.color(color.new(color.red, 0), "SELL colour", group = grpSig)
 
+grpZone = "Take profit / Stop loss zones"
+showZones = input.bool(true, "Show TP / SL zones on each trade", group = grpZone)
+showLevelLines = input.bool(true, "Show TP / SL lines while in a trade", group = grpZone)
+colTpZone = input.color(color.new(color.green, 80), "Take-profit zone", group = grpZone)
+colSlZone = input.color(color.new(color.red, 80), "Stop-loss zone", group = grpZone)
+
 grpVis = "Display"
 showHist  = input.bool(true, "Show visible-range histogram", group = grpVis)
 histWidth = input.int(30, "Histogram width (% of visible bars)", minval = 5, maxval = 100, group = grpVis)
@@ -231,8 +237,8 @@ if strategy.position_size != 0 and bar_index - strategy.opentrades.entry_bar_ind
 plot(poc, "POC", colPoc, 2, plot.style_linebr)
 plot(vah, "VAH", colVaLine, 1, plot.style_linebr)
 plot(val, "VAL", colVaLine, 1, plot.style_linebr)
-plot(strategy.position_size != 0 ? tradeStop : na, "Stop", color.orange, 1, plot.style_linebr)
-plot(strategy.position_size != 0 ? tradeTgt : na, "Target", color.green, 1, plot.style_linebr)
+plot(showLevelLines and strategy.position_size != 0 ? tradeStop : na, "Stop loss", color.red, 2, plot.style_linebr)
+plot(showLevelLines and strategy.position_size != 0 ? tradeTgt : na, "Take profit", color.green, 2, plot.style_linebr)
 
 // ───────────── BUY / SELL signals
 // BUY  = open a long (or cover a short).   SELL = close a long (or open a short).
@@ -272,6 +278,66 @@ if closedNow > 0
                  color = wasLong ? colSell : colBuy, textcolor = color.white, size = size.normal)
         alert((wasLong ? "SELL " : "BUY TO COVER ") + syminfo.ticker + " @ " + f_px(xp) + " | " + why +
              " | " + str.tostring(pct, "#.##") + "%", alert.freq_once_per_bar_close)
+
+// ───────────── Take-profit / stop-loss zones (like TradingView's Long/Short Position tool)
+// Green box = entry to take profit, red box = entry to stop loss. The boxes start on the
+// fill bar, grow while the trade is open, and stop on the bar the trade closes.
+f_pct(float a, float b) => (b - a) / a * 100
+
+f_zoneText(string tag, float px, float entry) =>
+    float pct = f_pct(entry, px)
+    tag + " " + f_px(px) + "  (" + (pct >= 0 ? "+" : "") + str.tostring(pct, "#.##") + "%)"
+
+f_setZone(box bx, float entry, float lvl, string tag, string suffix) =>
+    bx.set_top(math.max(entry, lvl))
+    bx.set_bottom(math.min(entry, lvl))
+    bx.set_text(f_zoneText(tag, lvl, entry) + suffix)
+
+f_rr(float entry, float tp, float sl) => "  " + str.tostring(math.abs(tp - entry) / math.abs(entry - sl), "#.#") + "R"
+
+f_drawZone(box tpB, box slB, line ln, float entry, float tp, float sl, int x) =>
+    f_setZone(tpB, entry, tp, "TP", f_rr(entry, tp, sl))
+    f_setZone(slB, entry, sl, "SL", "")
+    tpB.set_right(x)
+    slB.set_right(x)
+    ln.set_y1(entry)
+    ln.set_y2(entry)
+    ln.set_x2(x)
+
+var box tpBox = na
+var box slBox = na
+var line entryLine = na
+var bool zoneLive = false
+var float zoneTp = na   // kept separately so a new signal on the exit bar
+var float zoneSl = na   // doesn't overwrite the closing trade's levels
+
+if showZones
+    // A trade that closed on this bar: freeze its zone at the exit bar, using the real fill price.
+    if zoneLive and strategy.position_size == 0
+        float fill = strategy.closedtrades > 0 ? strategy.closedtrades.entry_price(strategy.closedtrades - 1) : entryLine.get_y1()
+        f_drawZone(tpBox, slBox, entryLine, fill, zoneTp, zoneSl, bar_index)
+        zoneLive := false
+    // An open trade: grow the zone and use the actual entry price.
+    else if zoneLive
+        f_drawZone(tpBox, slBox, entryLine, strategy.opentrades.entry_price(0), zoneTp, zoneSl, bar_index)
+    // A new signal: draw the zone from the next bar (the fill bar). The entry price is
+    // estimated from this close and corrected once the order fills.
+    if entered
+        float est = close
+        int x = bar_index + 1
+        tpBox := box.new(x, math.max(est, sTgt), x, math.min(est, sTgt),
+             border_color = color.new(color.green, 40), bgcolor = colTpZone,
+             text_size = size.small, text_color = color.green, text_halign = text.align_right,
+             text_valign = sig > 0 ? text.align_top : text.align_bottom)
+        slBox := box.new(x, math.max(est, sStop), x, math.min(est, sStop),
+             border_color = color.new(color.red, 40), bgcolor = colSlZone,
+             text_size = size.small, text_color = color.red, text_halign = text.align_right,
+             text_valign = sig > 0 ? text.align_bottom : text.align_top)
+        entryLine := line.new(x, est, x, est, color = color.gray, style = line.style_dotted)
+        zoneTp := sTgt
+        zoneSl := sStop
+        f_drawZone(tpBox, slBox, entryLine, est, sTgt, sStop, x)
+        zoneLive := true
 
 // ───────────── Position panel
 var table panel = table.new(position.top_right, 2, 5, bgcolor = color.new(color.black, 20), border_width = 1)
