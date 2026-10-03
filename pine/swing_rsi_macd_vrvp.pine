@@ -17,7 +17,7 @@
 // The histogram on the right always shows the true visible-range profile (like VRVP).
 strategy("Swing RSI + MACD + VRVP", overlay = true, initial_capital = 100000,
      commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 1,
-     max_bars_back = 5000, max_boxes_count = 500, max_lines_count = 100, max_labels_count = 500,
+     max_bars_back = 5000, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500,
      calc_on_every_tick = false)
 
 // ───────────── Inputs
