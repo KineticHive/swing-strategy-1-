@@ -1,0 +1,257 @@
+//@version=6
+// Swing strategy: RSI + MACD timing, Volume Profile (POC / VAH / VAL) location.
+// Mirrors the Python implementation in swing/strategy.py.
+//
+// Setups (signal on bar close, filled at next bar open):
+//   LONG  VAL bounce    – tagged VAL recently, closed back above it (below POC),
+//                         RSI was oversold and is rising, MACD crossed up recently.
+//         VAH breakout  – close breaks above VAH, RSI in bullish band, MACD > signal and > 0.
+//   SHORT VAH rejection / VAL breakdown – mirror images (off by default).
+//
+// Level source:
+//   "Rolling"        – profile of the last N bars, recomputed every bar. No look-ahead,
+//                      use this for backtesting.
+//   "Visible range"  – profile anchored at the left edge of the chart, developing bar by
+//                      bar up to the right edge. No look-ahead inside the range, but the
+//                      backtest changes whenever you scroll/zoom the chart.
+// The histogram on the right always shows the true visible-range profile (like VRVP).
+strategy("Swing RSI + MACD + VRVP", overlay = true, initial_capital = 100000,
+     commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 1,
+     max_bars_back = 5000, max_boxes_count = 500, max_lines_count = 100, calc_on_every_tick = false)
+
+// ───────────── Inputs
+grpRsi = "RSI"
+rsiLen        = input.int(14, "RSI length", minval = 2, group = grpRsi)
+rsiOversold   = input.float(35, "Oversold", group = grpRsi)
+rsiOverbought = input.float(65, "Overbought", group = grpRsi)
+rsiBullMin    = input.float(50, "Breakout RSI min", group = grpRsi)
+rsiBullMax    = input.float(75, "Breakout RSI max", group = grpRsi)
+
+grpMacd = "MACD"
+macdFast     = input.int(12, "Fast", group = grpMacd)
+macdSlow     = input.int(26, "Slow", group = grpMacd)
+macdSig      = input.int(9, "Signal", group = grpMacd)
+crossLookback = input.int(3, "Cross counts for N bars", minval = 1, group = grpMacd)
+
+grpVp = "Volume Profile"
+levelSource = input.string("Rolling", "Signal levels from", options = ["Rolling", "Visible range"], group = grpVp)
+vpLookback  = input.int(120, "Rolling lookback (bars)", minval = 10, maxval = 1000, group = grpVp)
+vpRows      = input.int(50, "Rows", minval = 10, maxval = 200, group = grpVp)
+vaPct       = input.float(70, "Value area %", minval = 10, maxval = 100, group = grpVp) / 100
+visMinBars  = input.int(20, "Visible range: min bars before signals", minval = 5, group = grpVp)
+visMaxBars  = input.int(1000, "Visible range: max bars in profile", minval = 50, maxval = 4999, group = grpVp)
+touchBars   = input.int(5, "VA edge touch window (bars)", minval = 1, group = grpVp)
+touchTolAtr = input.float(0.25, "Touch tolerance (ATR)", step = 0.05, group = grpVp)
+
+grpRisk = "Risk & exits"
+atrLen      = input.int(14, "ATR length", group = grpRisk)
+stopAtrMult = input.float(1.0, "Stop buffer (ATR)", step = 0.1, group = grpRisk)
+breakoutRR  = input.float(2.0, "Breakout target (R)", step = 0.25, group = grpRisk)
+revTarget   = input.string("VAH", "Reversion target", options = ["VAH", "POC"], group = grpRisk)
+maxHold     = input.int(30, "Max bars in trade", minval = 1, group = grpRisk)
+riskPct     = input.float(1.0, "Risk per trade (% equity)", step = 0.25, group = grpRisk) / 100
+
+grpSet = "Setups"
+useRev    = input.bool(true, "Reversion (VAL bounce / VAH rejection)", group = grpSet)
+useBrk    = input.bool(true, "Breakout (VAH breakout / VAL breakdown)", group = grpSet)
+useShorts = input.bool(false, "Enable shorts", group = grpSet)
+
+grpVis = "Display"
+showHist  = input.bool(true, "Show visible-range histogram", group = grpVis)
+histWidth = input.int(30, "Histogram width (% of visible bars)", minval = 5, maxval = 100, group = grpVis)
+colHist   = input.color(color.new(color.gray, 70), "Rows", group = grpVis)
+colVa     = input.color(color.new(color.blue, 60), "Value-area rows", group = grpVis)
+colPoc    = input.color(color.red, "POC", group = grpVis)
+colVaLine = input.color(color.blue, "VAH / VAL", group = grpVis)
+
+// ───────────── Volume profile over the last `len` bars (including the current one)
+// Each bar's volume is spread over the rows its high–low range overlaps.
+// Returns [poc, vah, val, rowVolumes, bottom, rowHeight].
+f_profile(int len, int rows, float va) =>
+    float top = high
+    float bot = low
+    for i = 0 to len - 1
+        top := math.max(top, high[i])
+        bot := math.min(bot, low[i])
+    float step = (top - bot) / rows
+    array<float> vols = array.new_float(rows, 0.0)
+    float poc = top
+    float vah = top
+    float val = bot
+    if step > 0
+        for i = 0 to len - 1
+            float h = high[i]
+            float l = low[i]
+            float v = nz(volume[i])
+            if h == l
+                int r = math.min(int((h - bot) / step), rows - 1)
+                vols.set(r, vols.get(r) + v)
+            else
+                int r0 = math.max(int((l - bot) / step), 0)
+                int r1 = math.min(int((h - bot) / step), rows - 1)
+                for r = r0 to r1
+                    float rlo = bot + r * step
+                    float ov = math.min(h, rlo + step) - math.max(l, rlo)
+                    if ov > 0
+                        vols.set(r, vols.get(r) + v * ov / (h - l))
+        int pocIdx = vols.indexof(vols.max())
+        float target = vols.sum() * va
+        float acc = vols.get(pocIdx)
+        int lo = pocIdx
+        int hi = pocIdx
+        while acc < target and (lo > 0 or hi < rows - 1)
+            float above = hi < rows - 1 ? vols.get(hi + 1) : -1.0
+            float below = lo > 0 ? vols.get(lo - 1) : -1.0
+            if above >= below
+                hi += 1
+                acc += above
+            else
+                lo -= 1
+                acc += below
+        poc := bot + (pocIdx + 0.5) * step
+        vah := bot + (hi + 1) * step
+        val := bot + lo * step
+    [poc, vah, val, vols, bot, step]
+
+// ───────────── Visible range bookkeeping
+leftT  = chart.left_visible_bar_time
+rightT = chart.right_visible_bar_time
+inVis  = time >= leftT and time <= rightT
+var int leftIdx = na
+if inVis and na(leftIdx)
+    leftIdx := bar_index
+visLen = inVis and not na(leftIdx) ? math.min(bar_index - leftIdx + 1, visMaxBars) : 0
+isVisRightEdge = inVis and (time == rightT or barstate.islast)
+
+// ───────────── Levels used for signals
+float poc = na
+float vah = na
+float val = na
+if levelSource == "Rolling"
+    if bar_index >= vpLookback - 1
+        [p, h, l, _v, _b, _s] = f_profile(vpLookback, vpRows, vaPct)
+        poc := p
+        vah := h
+        val := l
+else
+    if visLen >= visMinBars
+        [p, h, l, _v, _b, _s] = f_profile(visLen, vpRows, vaPct)
+        poc := p
+        vah := h
+        val := l
+
+// ───────────── Indicators
+rsiVal = ta.rsi(close, rsiLen)
+[macdLine, sigLine, hist] = ta.macd(close, macdFast, macdSlow, macdSig)
+atrVal = ta.atr(atrLen)
+
+bullCross = ta.crossover(macdLine, sigLine)
+bearCross = ta.crossunder(macdLine, sigLine)
+macdBullRecent = nz(ta.barssince(bullCross), 9999) < crossLookback
+macdBearRecent = nz(ta.barssince(bearCross), 9999) < crossLookback
+rsiUp   = rsiVal > rsiVal[1]
+rsiDown = rsiVal < rsiVal[1]
+rsiWasOversold   = ta.lowest(rsiVal, touchBars) <= rsiOversold
+rsiWasOverbought = ta.highest(rsiVal, touchBars) >= rsiOverbought
+
+tol = touchTolAtr * atrVal
+touchedVal = ta.highest(not na(val) and low <= val + tol ? 1 : 0, touchBars) > 0
+touchedVah = ta.highest(not na(vah) and high >= vah - tol ? 1 : 0, touchBars) > 0
+recentLow  = ta.lowest(low, touchBars)
+recentHigh = ta.highest(high, touchBars)
+haveLevels = not na(poc) and not na(atrVal) and not na(rsiVal)
+
+// ───────────── Setups
+longRev = haveLevels and useRev and touchedVal and close > val and close < poc and rsiWasOversold and rsiUp and macdBullRecent
+longBrk = haveLevels and useBrk and close > vah and close[1] <= nz(vah[1], 1e300) and rsiVal >= rsiBullMin and rsiVal <= rsiBullMax and macdLine > sigLine and macdLine > 0
+shortRev = haveLevels and useShorts and useRev and touchedVah and close < vah and close > poc and rsiWasOverbought and rsiDown and macdBearRecent
+shortBrk = haveLevels and useShorts and useBrk and close < val and close[1] >= nz(val[1], -1e300) and rsiVal >= 100 - rsiBullMax and rsiVal <= 100 - rsiBullMin and macdLine < sigLine and macdLine < 0
+
+buf = stopAtrMult * atrVal
+int sig = 0
+string setup = ""
+float sStop = na
+float sTgt = na
+// Priority: long reversion > short reversion > long breakout > short breakout.
+if longRev
+    sig := 1
+    setup := "VAL bounce"
+    sStop := math.min(recentLow, val) - buf
+    sTgt := revTarget == "VAH" ? vah : poc
+else if shortRev
+    sig := -1
+    setup := "VAH rejection"
+    sStop := math.max(recentHigh, vah) + buf
+    sTgt := revTarget == "VAH" ? val : poc
+else if longBrk
+    sig := 1
+    setup := "VAH breakout"
+    sStop := vah - buf
+    sTgt := close + breakoutRR * (close - sStop)
+else if shortBrk
+    sig := -1
+    setup := "VAL breakdown"
+    sStop := val + buf
+    sTgt := close - breakoutRR * (sStop - close)
+
+// ───────────── Orders
+var float tradeStop = na
+var float tradeTgt = na
+flat = strategy.position_size == 0
+if flat and sig != 0
+    riskPerUnit = math.abs(close - sStop)
+    qty = riskPerUnit > 0 ? math.min(strategy.equity * riskPct / riskPerUnit, strategy.equity / close) : 0.0
+    if qty > 0
+        tradeStop := sStop
+        tradeTgt := sTgt
+        strategy.entry(sig > 0 ? "Long" : "Short", sig > 0 ? strategy.long : strategy.short, qty = qty, comment = setup)
+
+if not na(tradeStop)
+    strategy.exit("Long exit", "Long", stop = tradeStop, limit = tradeTgt)
+    strategy.exit("Short exit", "Short", stop = tradeStop, limit = tradeTgt)
+
+if strategy.position_size > 0 and bearCross and rsiVal >= rsiOverbought
+    strategy.close("Long", comment = "Momentum")
+if strategy.position_size < 0 and bullCross and rsiVal <= rsiOversold
+    strategy.close("Short", comment = "Momentum")
+if strategy.position_size != 0 and bar_index - strategy.opentrades.entry_bar_index(0) >= maxHold
+    strategy.close_all(comment = "Time")
+
+// ───────────── Plots
+plot(poc, "POC", colPoc, 2, plot.style_linebr)
+plot(vah, "VAH", colVaLine, 1, plot.style_linebr)
+plot(val, "VAL", colVaLine, 1, plot.style_linebr)
+plot(strategy.position_size != 0 ? tradeStop : na, "Stop", color.orange, 1, plot.style_linebr)
+plot(strategy.position_size != 0 ? tradeTgt : na, "Target", color.green, 1, plot.style_linebr)
+plotshape(sig > 0 and flat, "Long signal", shape.triangleup, location.belowbar, color.green, size = size.small)
+plotshape(sig < 0 and flat, "Short signal", shape.triangledown, location.abovebar, color.red, size = size.small)
+
+// ───────────── Visible-range histogram (drawn once, at the right edge of the chart)
+var array<box> boxes = array.new<box>()
+var array<line> vrLines = array.new<line>()
+if showHist and isVisRightEdge and visLen >= 2
+    for b in boxes
+        b.delete()
+    boxes.clear()
+    for ln in vrLines
+        ln.delete()
+    vrLines.clear()
+    [vPoc, vVah, vVal, vols, vBot, vStep] = f_profile(visLen, vpRows, vaPct)
+    if vStep > 0
+        float maxVol = vols.max()
+        int widthBars = math.max(int(visLen * histWidth / 100), 1)
+        for r = 0 to vpRows - 1
+            float rlo = vBot + r * vStep
+            float rhi = rlo + vStep
+            int w = int(widthBars * vols.get(r) / maxVol)
+            if w > 0
+                bool inVa = rlo >= vVal - vStep * 0.01 and rhi <= vVah + vStep * 0.01
+                boxes.push(box.new(bar_index - w, rhi, bar_index, rlo, border_color = na, bgcolor = inVa ? colVa : colHist))
+        int x0 = bar_index - visLen + 1
+        vrLines.push(line.new(x0, vPoc, bar_index, vPoc, color = colPoc, width = 2, style = line.style_dashed))
+        vrLines.push(line.new(x0, vVah, bar_index, vVah, color = colVaLine, style = line.style_dashed))
+        vrLines.push(line.new(x0, vVal, bar_index, vVal, color = colVaLine, style = line.style_dashed))
+
+// Alerts
+alertcondition(sig > 0, "Long signal", "Swing long setup on {{ticker}} @ {{close}}")
+alertcondition(sig < 0, "Short signal", "Swing short setup on {{ticker}} @ {{close}}")
