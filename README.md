@@ -55,7 +55,8 @@ visible-range profile, the same as TradingView's VRVP.
 ### TradingView
 1. Open the Pine Editor, paste `pine/swing_rsi_macd_vrvp.pine`, and click *Add to chart*.
 2. Use a daily or 4h chart for swing trading. Adjust the inputs, then check the Strategy Tester.
-3. For alerts, create an alert on the strategy and choose *alert() function calls only*. Each alert includes the setup, stop and target.
+3. **BUY / SELL signals**: a green **BUY** label marks a long entry signal and shows the setup, stop and target. A red **SELL** label marks the bar where the long closed, with the exit reason (Target, Stop, Momentum or Time) and the P/L %. With shorts on, a short entry shows **SELL / Short** and its exit shows **BUY / Cover**. A panel in the top-right corner shows the current position, entry, stop, target and open P/L.
+4. For alerts, create an alert on the strategy and choose *alert() function calls only*. Each alert includes the setup, stop and target.
 
 ### Python
 ```bash

@@ -17,7 +17,8 @@
 // The histogram on the right always shows the true visible-range profile (like VRVP).
 strategy("Swing RSI + MACD + VRVP", overlay = true, initial_capital = 100000,
      commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 1,
-     max_bars_back = 5000, max_boxes_count = 500, max_lines_count = 100, calc_on_every_tick = false)
+     max_bars_back = 5000, max_boxes_count = 500, max_lines_count = 100, max_labels_count = 500,
+     calc_on_every_tick = false)
 
 // ───────────── Inputs
 grpRsi = "RSI"
@@ -55,6 +56,13 @@ grpSet = "Setups"
 useRev    = input.bool(true, "Reversion (VAL bounce / VAH rejection)", group = grpSet)
 useBrk    = input.bool(true, "Breakout (VAH breakout / VAL breakdown)", group = grpSet)
 useShorts = input.bool(false, "Enable shorts", group = grpSet)
+
+grpSig = "Buy / Sell signals"
+showSignals = input.bool(true, "Show BUY / SELL labels", group = grpSig)
+showDetails = input.bool(true, "Show setup, stop, target and P/L on labels", group = grpSig)
+showPanel   = input.bool(true, "Show position panel", group = grpSig)
+colBuy      = input.color(color.new(color.green, 0), "BUY colour", group = grpSig)
+colSell     = input.color(color.new(color.red, 0), "SELL colour", group = grpSig)
 
 grpVis = "Display"
 showHist  = input.bool(true, "Show visible-range histogram", group = grpVis)
@@ -198,17 +206,19 @@ else if shortBrk
 var float tradeStop = na
 var float tradeTgt = na
 flat = strategy.position_size == 0
+bool entered = false
 if flat and sig != 0
     riskPerUnit = math.abs(close - sStop)
     qty = riskPerUnit > 0 ? math.min(strategy.equity * riskPct / riskPerUnit, strategy.equity / close) : 0.0
     if qty > 0
         tradeStop := sStop
         tradeTgt := sTgt
+        entered := true
         strategy.entry(sig > 0 ? "Long" : "Short", sig > 0 ? strategy.long : strategy.short, qty = qty, comment = setup)
 
 if not na(tradeStop)
-    strategy.exit("Long exit", "Long", stop = tradeStop, limit = tradeTgt)
-    strategy.exit("Short exit", "Short", stop = tradeStop, limit = tradeTgt)
+    strategy.exit("Long exit", "Long", stop = tradeStop, limit = tradeTgt, comment_profit = "Target", comment_loss = "Stop")
+    strategy.exit("Short exit", "Short", stop = tradeStop, limit = tradeTgt, comment_profit = "Target", comment_loss = "Stop")
 
 if strategy.position_size > 0 and bearCross and rsiVal >= rsiOverbought
     strategy.close("Long", comment = "Momentum")
@@ -223,8 +233,63 @@ plot(vah, "VAH", colVaLine, 1, plot.style_linebr)
 plot(val, "VAL", colVaLine, 1, plot.style_linebr)
 plot(strategy.position_size != 0 ? tradeStop : na, "Stop", color.orange, 1, plot.style_linebr)
 plot(strategy.position_size != 0 ? tradeTgt : na, "Target", color.green, 1, plot.style_linebr)
-plotshape(sig > 0 and flat, "Long signal", shape.triangleup, location.belowbar, color.green, size = size.small)
-plotshape(sig < 0 and flat, "Short signal", shape.triangledown, location.abovebar, color.red, size = size.small)
+
+// ───────────── BUY / SELL signals
+// BUY  = open a long (or cover a short).   SELL = close a long (or open a short).
+// Entry signals appear on the signal bar's close; the order fills at the next bar's open.
+// Exit signals appear on the bar where the stop, target, momentum or time exit filled.
+f_px(float x) => str.tostring(x, format.mintick)
+
+if entered
+    bool isLong = sig > 0
+    string head = isLong ? "BUY" : "SELL\nShort"
+    string info = "\n" + setup + "\nSL " + f_px(sStop) + "\nTP " + f_px(sTgt)
+    if showSignals
+        label.new(bar_index, isLong ? low : high, head + (showDetails ? info : ""),
+             yloc = isLong ? yloc.belowbar : yloc.abovebar,
+             style = isLong ? label.style_label_up : label.style_label_down,
+             color = isLong ? colBuy : colSell, textcolor = color.white, size = size.normal)
+    alert((isLong ? "BUY " : "SELL SHORT ") + syminfo.ticker + " @ " + f_px(close) + " | " + setup +
+         " | SL " + f_px(sStop) + " | TP " + f_px(sTgt), alert.freq_once_per_bar_close)
+
+var int prevClosed = 0
+int closedNow = strategy.closedtrades - prevClosed
+prevClosed := strategy.closedtrades
+if closedNow > 0
+    for k = strategy.closedtrades - closedNow to strategy.closedtrades - 1
+        bool wasLong = strategy.closedtrades.size(k) > 0
+        float ep = strategy.closedtrades.entry_price(k)
+        float xp = strategy.closedtrades.exit_price(k)
+        float pct = (xp - ep) / ep * 100 * (wasLong ? 1 : -1)
+        string why = strategy.closedtrades.exit_comment(k)
+        why := why == "" ? strategy.closedtrades.exit_id(k) : why
+        string head = wasLong ? "SELL" : "BUY\nCover"
+        string info = "\n" + why + "\n" + (pct >= 0 ? "+" : "") + str.tostring(pct, "#.##") + "%"
+        if showSignals
+            label.new(bar_index, wasLong ? high : low, head + (showDetails ? info : ""),
+                 yloc = wasLong ? yloc.abovebar : yloc.belowbar,
+                 style = wasLong ? label.style_label_down : label.style_label_up,
+                 color = wasLong ? colSell : colBuy, textcolor = color.white, size = size.normal)
+        alert((wasLong ? "SELL " : "BUY TO COVER ") + syminfo.ticker + " @ " + f_px(xp) + " | " + why +
+             " | " + str.tostring(pct, "#.##") + "%", alert.freq_once_per_bar_close)
+
+// ───────────── Position panel
+var table panel = table.new(position.top_right, 2, 5, bgcolor = color.new(color.black, 20), border_width = 1)
+if showPanel and barstate.islast
+    float posSize = strategy.position_size
+    string posTxt = posSize > 0 ? "LONG" : posSize < 0 ? "SHORT" : "FLAT"
+    color posCol = posSize > 0 ? colBuy : posSize < 0 ? colSell : color.gray
+    float openPct = posSize != 0 ? (close - strategy.position_avg_price) / strategy.position_avg_price * 100 * math.sign(posSize) : na
+    table.cell(panel, 0, 0, "Position", text_color = color.white)
+    table.cell(panel, 1, 0, posTxt, text_color = color.white, bgcolor = posCol)
+    table.cell(panel, 0, 1, "Entry", text_color = color.white)
+    table.cell(panel, 1, 1, posSize != 0 ? f_px(strategy.position_avg_price) : "-", text_color = color.white)
+    table.cell(panel, 0, 2, "Stop", text_color = color.white)
+    table.cell(panel, 1, 2, posSize != 0 ? f_px(tradeStop) : "-", text_color = color.orange)
+    table.cell(panel, 0, 3, "Target", text_color = color.white)
+    table.cell(panel, 1, 3, posSize != 0 ? f_px(tradeTgt) : "-", text_color = color.lime)
+    table.cell(panel, 0, 4, "Open P/L", text_color = color.white)
+    table.cell(panel, 1, 4, posSize != 0 ? str.tostring(openPct, "#.##") + "%" : "-", text_color = openPct >= 0 ? color.lime : color.red)
 
 // ───────────── Visible-range histogram (drawn once, at the right edge of the chart)
 var array<box> boxes = array.new<box>()
@@ -253,5 +318,4 @@ if showHist and isVisRightEdge and visLen >= 2
         vrLines.push(line.new(x0, vVal, bar_index, vVal, color = colVaLine, style = line.style_dashed))
 
 // Alerts: create an alert on this strategy and choose "alert() function calls only".
-if sig != 0 and flat
-    alert((sig > 0 ? "LONG " : "SHORT ") + setup + " on " + syminfo.ticker + " @ " + str.tostring(close) + " | stop " + str.tostring(sStop, format.mintick) + " | target " + str.tostring(sTgt, format.mintick), alert.freq_once_per_bar_close)
+// BUY / SELL alerts are sent from the signal section above.
